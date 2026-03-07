@@ -341,7 +341,7 @@ def _parse_judge_response(transcript: List[Dict[str, Any]]) -> Dict[str, Any]:
     # Fallback: try to extract numeric scores from prose responses.
     # Models sometimes return "Total: 0.72" or "Overall score: 0.65" instead of JSON.
     score_pattern = re.search(
-        r"(?:total|overall|final)\s*(?:score)?[:\s]*([01]\.?\d*)",
+        r"(?:total|overall|final)\s*(?:score)?[:\s]*(0\.\d+|1\.0+)",
         raw_text,
         re.IGNORECASE,
     )
