@@ -16,6 +16,7 @@ from lib_tasks import Task
 
 logger = logging.getLogger(__name__)
 MAX_OPENCLAW_MESSAGE_CHARS = 4000
+OPENCLAW_CONTROL_TIMEOUT = 30
 
 
 def slugify_model(model_id: str) -> str:
@@ -39,7 +40,11 @@ def _get_agent_workspace(agent_id: str) -> Path | None:
             capture_output=True,
             text=True,
             check=False,
+            timeout=OPENCLAW_CONTROL_TIMEOUT,
         )
+    except subprocess.TimeoutExpired:
+        logger.warning("openclaw agents list timed out")
+        return None
         if list_result.returncode != 0:
             return None
 
@@ -82,12 +87,16 @@ def ensure_agent_exists(agent_id: str, model_id: str, workspace_dir: Path) -> bo
             capture_output=True,
             text=True,
             check=False,
+            timeout=OPENCLAW_CONTROL_TIMEOUT,
         )
+    except subprocess.TimeoutExpired:
+        logger.warning("openclaw agents list timed out")
+        list_result = None
     except FileNotFoundError:
         logger.error("openclaw CLI not found while listing agents")
         return False
 
-    if list_result.returncode == 0:
+    if list_result is not None and list_result.returncode == 0:
         # Check for exact agent ID match — avoid substring false positives
         # (e.g. "bench-foo-4" matching "bench-foo-4-5" in the output).
         # Output format is "- <agent_id>" or "- <agent_id> (default)" per line.
@@ -105,7 +114,10 @@ def ensure_agent_exists(agent_id: str, model_id: str, workspace_dir: Path) -> bo
         if agent_id in existing_agents or normalized_id in existing_agents:
             # Agent exists — check if workspace matches
             current_workspace = _get_agent_workspace(agent_id)
-            if current_workspace is not None and current_workspace.resolve() == workspace_dir.resolve():
+            if (
+                current_workspace is not None
+                and current_workspace.resolve() == workspace_dir.resolve()
+            ):
                 logger.info("Agent %s already exists with correct workspace", agent_id)
                 return False
             # Workspace is stale or unknown — delete and recreate
@@ -121,6 +133,7 @@ def ensure_agent_exists(agent_id: str, model_id: str, workspace_dir: Path) -> bo
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=OPENCLAW_CONTROL_TIMEOUT,
             )
 
     normalized_model = normalize_model_id(model_id)
@@ -141,7 +154,11 @@ def ensure_agent_exists(agent_id: str, model_id: str, workspace_dir: Path) -> bo
             capture_output=True,
             text=True,
             check=False,
+            timeout=OPENCLAW_CONTROL_TIMEOUT,
         )
+    except subprocess.TimeoutExpired:
+        logger.error("openclaw agents add timed out")
+        return False
     except FileNotFoundError:
         logger.error("openclaw CLI not found while creating agent")
         return False
@@ -400,7 +417,9 @@ def execute_openclaw_task(
     logger.info("   Task: %s", task.name)
     logger.info("   Category: %s", task.category)
     if verbose:
-        logger.info("   Prompt: %s", task.prompt[:500] + "..." if len(task.prompt) > 500 else task.prompt)
+        logger.info(
+            "   Prompt: %s", task.prompt[:500] + "..." if len(task.prompt) > 500 else task.prompt
+        )
 
     # Clean up previous session transcripts so we can reliably find this task's
     # transcript (OpenClaw uses its own UUID-based naming, not our session ID).
@@ -467,7 +486,7 @@ def execute_openclaw_task(
         if stderr:
             logger.info("   [VERBOSE] Stderr:\n%s", stderr[:1000])
         logger.info("   [VERBOSE] Transcript entries: %d", len(transcript))
-        
+
         # Show agent responses from transcript
         for entry in transcript:
             if entry.get("type") == "message":
@@ -481,7 +500,7 @@ def execute_openclaw_task(
                 elif role == "user":
                     preview = content[:200] + "..." if len(content) > 200 else content
                     logger.info("   [VERBOSE] User message: %s", preview)
-        
+
         # Show workspace files after task
         if workspace.exists():
             logger.info("   [VERBOSE] Workspace files after task:")
