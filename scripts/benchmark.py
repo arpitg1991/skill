@@ -229,6 +229,11 @@ def _parse_args() -> argparse.Namespace:
         metavar="KEY",
         help="Official key to mark submission as official (can also use PINCHBENCH_OFFICIAL_KEY env var)",
     )
+    parser.add_argument(
+        "--no-fail-fast",
+        action="store_true",
+        help="Continue running all tasks even if sanity check scores 0%",
+    )
     return parser.parse_args()
 
 
@@ -339,18 +344,18 @@ def _compute_efficiency_summary(
         if tot > 0:
             tasks_with_usage += 1
 
-        per_task_efficiency.append({
-            "task_id": task_id,
-            "score": round(score, 4),
-            "total_tokens": tot,
-            "cost_usd": round(cost, 6),
-            "tokens_per_score_point": round(tot / score, 1) if score > 0 else None,
-        })
+        per_task_efficiency.append(
+            {
+                "task_id": task_id,
+                "score": round(score, 4),
+                "total_tokens": tot,
+                "cost_usd": round(cost, 6),
+                "tokens_per_score_point": round(tot / score, 1) if score > 0 else None,
+            }
+        )
 
     # Aggregate scores
-    all_scores = [
-        float(g.get("mean", 0.0)) for g in grades_by_task_id.values()
-    ]
+    all_scores = [float(g.get("mean", 0.0)) for g in grades_by_task_id.values()]
     total_score = sum(all_scores)
     num_tasks = len(all_scores)
 
@@ -365,14 +370,10 @@ def _compute_efficiency_summary(
         "tokens_per_task": round(total_tokens / num_tasks, 1) if num_tasks > 0 else 0,
         "cost_per_task_usd": round(total_cost_usd / num_tasks, 6) if num_tasks > 0 else 0,
         "score_per_1k_tokens": (
-            round(total_score / (total_tokens / 1000), 6)
-            if total_tokens > 0
-            else None
+            round(total_score / (total_tokens / 1000), 6) if total_tokens > 0 else None
         ),
         "score_per_dollar": (
-            round(total_score / total_cost_usd, 4)
-            if total_cost_usd > 0
-            else None
+            round(total_score / total_cost_usd, 4) if total_cost_usd > 0 else None
         ),
         "per_task": per_task_efficiency,
     }
@@ -384,9 +385,7 @@ def _log_efficiency_summary(
     grades_by_task_id: Dict[str, Dict[str, Any]],
 ) -> None:
     """Log a human-readable token efficiency summary."""
-    all_scores = [
-        float(g.get("mean", 0.0)) for g in grades_by_task_id.values()
-    ]
+    all_scores = [float(g.get("mean", 0.0)) for g in grades_by_task_id.values()]
     mean_score = statistics.mean(all_scores) if all_scores else 0.0
 
     logger.info("\n%s", "=" * 80)
@@ -426,30 +425,30 @@ def _log_category_summary(
     """Log a summary grouped by category, matching the PinchBench website format."""
     # Group scores by category
     category_scores: Dict[str, Dict[str, float]] = {}
-    
+
     for entry in task_entries:
         task_id = entry["task_id"]
         task = tasks_by_id.get(task_id)
         if not task:
             continue
-        
+
         category = task.category.upper() if task.category else "UNCATEGORIZED"
         grading = entry.get("grading", {})
         mean_score = float(grading.get("mean", 0.0))
         max_score = 1.0  # Each task is scored 0-1
-        
+
         if category not in category_scores:
             category_scores[category] = {"earned": 0.0, "possible": 0.0, "task_count": 0}
-        
+
         category_scores[category]["earned"] += mean_score
         category_scores[category]["possible"] += max_score
         category_scores[category]["task_count"] += 1
-    
+
     # Calculate overall totals
     total_earned = sum(c["earned"] for c in category_scores.values())
     total_possible = sum(c["possible"] for c in category_scores.values())
     overall_pct = (total_earned / total_possible * 100) if total_possible > 0 else 0
-    
+
     logger.info("\n%s", "=" * 80)
     logger.info("🦀 PINCHBENCH SCORE SUMMARY")
     logger.info("%s", "=" * 80)
@@ -458,14 +457,14 @@ def _log_category_summary(
     logger.info("")
     logger.info("   %-20s %8s %12s", "CATEGORY", "SCORE", "TASKS")
     logger.info("   %s", "-" * 44)
-    
+
     # Sort categories alphabetically for consistent output
     for category in sorted(category_scores.keys()):
         data = category_scores[category]
         pct = (data["earned"] / data["possible"] * 100) if data["possible"] > 0 else 0
         task_count = int(data["task_count"])
         task_label = "task" if task_count == 1 else "tasks"
-        
+
         # Color indicator based on score
         if pct >= 90:
             indicator = "🟢"
@@ -473,7 +472,7 @@ def _log_category_summary(
             indicator = "🟡"
         else:
             indicator = "🔴"
-        
+
         logger.info(
             "   %s %-17s %6.1f%% %6d %s",
             indicator,
@@ -482,7 +481,7 @@ def _log_category_summary(
             task_count,
             task_label,
         )
-    
+
     logger.info("   %s", "-" * 44)
     logger.info("%s", "=" * 80)
 
@@ -566,6 +565,7 @@ def main():
     task_ids = _select_task_ids(runner.tasks, args.suite)
     results = []
     grades_by_task_id = {}
+    sanity_task_id = "task_00_sanity"
 
     tasks_to_run = runner.tasks
     if task_ids is not None:
@@ -613,7 +613,9 @@ def main():
                     "stderr": execution_error,
                 }
             try:
-                grade_kwargs = dict(task=task, execution_result=result, skill_dir=skill_dir, verbose=args.verbose)
+                grade_kwargs = dict(
+                    task=task, execution_result=result, skill_dir=skill_dir, verbose=args.verbose
+                )
                 if args.judge:
                     grade_kwargs["judge_model"] = args.judge
                 grade = grade_task(**grade_kwargs)
@@ -659,6 +661,17 @@ def main():
             "min": min(task_scores),
             "max": max(task_scores),
         }
+
+        if (
+            task.task_id == sanity_task_id
+            and grades_by_task_id[task.task_id]["mean"] == 0.0
+            and not args.no_fail_fast
+        ):
+            logger.error(
+                "🚨 FAIL FAST: Sanity check (%s) scored 0%%. Aborting benchmark run to avoid wasting resources.",
+                sanity_task_id,
+            )
+            sys.exit(3)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
