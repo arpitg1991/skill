@@ -584,6 +584,7 @@ def main():
     runs_per_task = max(1, args.runs)
     for i, task in enumerate(tasks_to_run, 1):
         task_grades = []
+        task_results = []
         for run_index in range(runs_per_task):
             logger.info("\n%s", "=" * 80)
             logger.info(
@@ -643,6 +644,7 @@ def main():
                     notes=note,
                 )
             task_grades.append(grade)
+            task_results.append(result)
             results.append(result)
 
             # Log score immediately after grading
@@ -671,16 +673,25 @@ def main():
             "max": max(task_scores),
         }
 
+        all_runs_missing_transcript = all(
+            not run_result.get("transcript") for run_result in task_results
+        )
         if (
             task.task_id == sanity_task_id
             and grades_by_task_id[task.task_id]["mean"] == 0.0
             and not args.no_fail_fast
+            and not all_runs_missing_transcript
         ):
             logger.error(
                 "🚨 FAIL FAST: Sanity check (%s) scored 0%%. Aborting benchmark run to avoid wasting resources.",
                 sanity_task_id,
             )
             sys.exit(3)
+        if task.task_id == sanity_task_id and grades_by_task_id[task.task_id]["mean"] == 0.0:
+            if all_runs_missing_transcript:
+                logger.warning(
+                    "⚠️ Sanity check scored 0%% but transcripts were missing for all runs; skipping fail-fast as likely infrastructure/logging issue."
+                )
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

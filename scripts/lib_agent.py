@@ -10,7 +10,7 @@ import os
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from urllib import error, request
 
 from lib_tasks import Task
@@ -26,6 +26,14 @@ class ModelValidationError(Exception):
 
 
 MAX_OPENCLAW_MESSAGE_CHARS = int(os.environ.get("PINCHBENCH_MAX_MSG_CHARS", "4000"))
+
+
+def _coerce_subprocess_output(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
 
 
 def slugify_model(model_id: str) -> str:
@@ -278,8 +286,8 @@ def cleanup_agent_sessions(agent_id: str) -> None:
     if not sessions_dir.exists():
         return
     removed = 0
-    for pattern in ("*.jsonl", "*.jsonl.lock"):
-        for path in sessions_dir.glob(pattern):
+    for pattern in ("*.jsonl", "*.jsonl.lock", "*.ndjson"):
+        for path in sessions_dir.rglob(pattern):
             try:
                 path.unlink()
                 removed += 1
@@ -416,11 +424,47 @@ def _resolve_session_id_from_store(agent_id: str) -> str | None:
     return None
 
 
+def _find_transcript_path_from_sessions_store(agent_id: str) -> Optional[Path]:
+    """Best-effort transcript path resolution from sessions.json payload values."""
+    agent_dir = _get_agent_store_dir(agent_id)
+    sessions_store = agent_dir / "sessions" / "sessions.json"
+    if not sessions_store.exists():
+        return None
+    try:
+        payload = json.loads(sessions_store.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    def _iter_strings(node: Any):
+        if isinstance(node, str):
+            yield node
+        elif isinstance(node, dict):
+            for value in node.values():
+                yield from _iter_strings(value)
+        elif isinstance(node, list):
+            for value in node:
+                yield from _iter_strings(value)
+
+    suffixes = (".jsonl", ".ndjson")
+    session_root = agent_dir / "sessions"
+    for value in _iter_strings(payload):
+        if not value.endswith(suffixes):
+            continue
+        candidate = Path(value)
+        if not candidate.is_absolute():
+            candidate = session_root / value
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def _find_recent_session_path(agent_dir: Path, started_at: float) -> Path | None:
     sessions_dir = agent_dir / "sessions"
     if not sessions_dir.exists():
         return None
-    candidates = list(sessions_dir.glob("*.jsonl"))
+    candidates = list(sessions_dir.rglob("*.jsonl")) + list(sessions_dir.rglob("*.ndjson"))
     if not candidates:
         return None
     tolerance_seconds = 5.0
@@ -442,19 +486,38 @@ def _load_transcript(agent_id: str, session_id: str, started_at: float) -> List[
     #   1. Resolve the real session ID from sessions.json
     #   2. Glob for any .jsonl in the sessions dir (most-recently-modified)
     #   3. Try our passed-in session ID as a last resort
-    for attempt in range(6):
+    for attempt in range(15):
         # 1. Try sessions.json first — OpenClaw writes the real UUID here
         resolved_session_id = _resolve_session_id_from_store(agent_id)
         if resolved_session_id:
-            candidate = agent_dir / "sessions" / f"{resolved_session_id}.jsonl"
-            if candidate.exists():
-                transcript_path = candidate
-                logger.info(
-                    "Found transcript via sessions.json: %s (attempt %s)",
-                    candidate.name,
-                    attempt + 1,
-                )
+            session_dir = agent_dir / "sessions"
+            for candidate in (
+                session_dir / f"{resolved_session_id}.jsonl",
+                session_dir / f"{resolved_session_id}.ndjson",
+                session_dir / resolved_session_id / "transcript.jsonl",
+                session_dir / resolved_session_id / "events.jsonl",
+            ):
+                if candidate.exists():
+                    transcript_path = candidate
+                    logger.info(
+                        "Found transcript via sessions.json: %s (attempt %s)",
+                        candidate.name,
+                        attempt + 1,
+                    )
+                    break
+            if transcript_path is not None:
                 break
+
+        # 1b. Parse transcript-like paths from sessions.json values
+        candidate_from_store = _find_transcript_path_from_sessions_store(agent_id)
+        if candidate_from_store is not None:
+            transcript_path = candidate_from_store
+            logger.info(
+                "Found transcript via sessions.json path: %s (attempt %s)",
+                candidate_from_store,
+                attempt + 1,
+            )
+            break
 
         # 2. Glob fallback — pick the most recently modified .jsonl
         recent_path = _find_recent_session_path(agent_dir, started_at)
@@ -468,17 +531,22 @@ def _load_transcript(agent_id: str, session_id: str, started_at: float) -> List[
             break
 
         # 3. Try our passed-in session ID (unlikely to work, but check anyway)
-        direct_path = agent_dir / "sessions" / f"{session_id}.jsonl"
-        if direct_path.exists():
-            transcript_path = direct_path
-            logger.info(
-                "Found transcript via passed session ID: %s (attempt %s)",
-                direct_path.name,
-                attempt + 1,
-            )
+        for direct_path in (
+            agent_dir / "sessions" / f"{session_id}.jsonl",
+            agent_dir / "sessions" / f"{session_id}.ndjson",
+        ):
+            if direct_path.exists():
+                transcript_path = direct_path
+                logger.info(
+                    "Found transcript via passed session ID: %s (attempt %s)",
+                    direct_path.name,
+                    attempt + 1,
+                )
+                break
+        if transcript_path is not None:
             break
 
-        if attempt < 5:
+        if attempt < 14:
             time.sleep(1.0)
 
     if transcript_path is None:
@@ -490,6 +558,13 @@ def _load_transcript(agent_id: str, session_id: str, started_at: float) -> List[
                 agent_id,
                 [f.name for f in all_files],
             )
+            sessions_store = sessions_dir / "sessions.json"
+            if sessions_store.exists():
+                try:
+                    payload_preview = sessions_store.read_text(encoding="utf-8")[:1200]
+                    logger.warning("sessions.json preview: %s", payload_preview)
+                except OSError as exc:
+                    logger.warning("Could not read sessions.json preview: %s", exc)
         else:
             logger.warning(
                 "Transcript not found — sessions dir does not exist: %s",
@@ -617,8 +692,8 @@ def execute_openclaw_task(
                     break
             except subprocess.TimeoutExpired as exc:
                 timed_out = True
-                stdout += exc.stdout or ""
-                stderr += exc.stderr or ""
+                stdout += _coerce_subprocess_output(exc.stdout)
+                stderr += _coerce_subprocess_output(exc.stderr)
                 break
             except FileNotFoundError as exc:
                 stderr = f"openclaw command not found: {exc}"
@@ -648,8 +723,8 @@ def execute_openclaw_task(
             exit_code = result.returncode
         except subprocess.TimeoutExpired as exc:
             timed_out = True
-            stdout = exc.stdout or ""
-            stderr = exc.stderr or ""
+            stdout = _coerce_subprocess_output(exc.stdout)
+            stderr = _coerce_subprocess_output(exc.stderr)
         except FileNotFoundError as exc:
             stderr = f"openclaw command not found: {exc}"
 
@@ -792,8 +867,8 @@ def run_openclaw_prompt(
                 break
         except subprocess.TimeoutExpired as exc:
             timed_out = True
-            stdout += exc.stdout or ""
-            stderr += exc.stderr or ""
+            stdout += _coerce_subprocess_output(exc.stdout)
+            stderr += _coerce_subprocess_output(exc.stderr)
             break
         except FileNotFoundError as exc:
             stderr += f"openclaw command not found: {exc}"
